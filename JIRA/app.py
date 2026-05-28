@@ -937,7 +937,10 @@ def _format_config_time(alert_time):
 
 
 def _format_description(alert, notes=None):
-    rules = "\n** ".join(rule.name for rule in alert.matched_rules)
+    if hasattr(alert, "matched_rules"):
+        rules = "\n** ".join(rule.name for rule in alert.matched_rules)
+    else:
+        rules = "\n** ".join(p.pattern for p in alert.matched_indicator_patterns)
     entities = "\n** ".join(
         entity.entity_type
         + ": "
@@ -967,10 +970,11 @@ def _format_description(alert, notes=None):
         for indicator in alert.indicators
     )
     mitres = []
-    for rule in alert.matched_rules:
-        for matched_filter in rule.matched_filters:
-            for tech in matched_filter.mitre_technique_ids:
-                mitres.append(tech)
+    if hasattr(alert, "matched_rules"):
+        for rule in alert.matched_rules:
+            for matched_filter in rule.matched_filters:
+                for tech in matched_filter.mitre_technique_ids:
+                    mitres.append(tech)
     mitres = "\n** ".join(mitres)
     
     # 格式化notes部分
