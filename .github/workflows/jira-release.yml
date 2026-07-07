@@ -1,0 +1,55 @@
+name: "JIRA Connector Release"
+
+# Triggered by pushing a tag matching jira-v* (e.g. jira-v1.0.0).
+# Packages only the JIRA/ directory into a tarball, publishes a versioned
+# GitHub release, and refreshes the moving "jira-latest" release/tag that the
+# README download link points to.
+on:
+  push:
+    tags:
+      - 'jira-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Package and publish JIRA connector
+    runs-on: ubuntu-latest
+    env:
+      ASSET_NAME: tm-v1-jira-connector.tar.gz
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          # Tag looks like "jira-v1.0.0"; strip the "jira-v" prefix.
+          version="${GITHUB_REF_NAME#jira-v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Releasing JIRA connector version ${version}"
+
+      - name: Package JIRA connector
+        run: |
+          # Stamp the version into the tarball so the artifact is self-describing.
+          echo "${{ steps.version.outputs.version }}" > JIRA/VERSION
+          tar -czf "${ASSET_NAME}" -C JIRA .
+          echo "Built ${ASSET_NAME}:"
+          tar -tzf "${ASSET_NAME}"
+
+      - name: Publish versioned release
+        run: |
+          gh release create "${GITHUB_REF_NAME}" "${ASSET_NAME}" \
+            --title "JIRA Connector v${{ steps.version.outputs.version }}" \
+            --notes "Trend Vision One JIRA connector v${{ steps.version.outputs.version }}. Download: ${ASSET_NAME}"
+
+      - name: Refresh jira-latest moving release
+        run: |
+          # Recreate the moving release so the stable README link always serves
+          # the newest JIRA build, independent of other connectors' releases.
+          gh release delete jira-latest --yes --cleanup-tag || true
+          gh release create jira-latest "${ASSET_NAME}" \
+            --title "JIRA Connector (latest: v${{ steps.version.outputs.version }})" \
+            --notes "Always points to the newest JIRA connector release (currently v${{ steps.version.outputs.version }})."

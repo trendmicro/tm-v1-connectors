@@ -1,5 +1,14 @@
 ## Trend Vision One™ JIRA connector
 
+#### Download
+Latest packaged release (always points to the newest build):
+- [tm-v1-jira-connector.tar.gz](https://github.com/trendmicro/tm-v1-connectors/releases/download/jira-latest/tm-v1-jira-connector.tar.gz)
+
+Extract it, then follow the Quick start below:
+```
+tar -xzf tm-v1-jira-connector.tar.gz
+```
+
 #### Prerequisites
 - [Python 3.8](https://www.python.org/downloads/) or newer.
 - JIRA API url.
