@@ -8,8 +8,10 @@ summary_prefix: synced
 # Workbench alerts configuration
 # Poll time in seconds
 poll_time: 15
-# Workbench alerts retrieval start time (UTC timezone),
-# If empty, defaults to 24 hours before the request is made.
+# Workbench alerts retrieval start time (UTC timezone).
+# Accepts a YAML timestamp (e.g. 2025-08-07 08:20:00); it is sent to Vision One
+# in ISO 8601 form (2025-08-07T08:20:00Z). If empty, defaults to 24 hours
+# before the request is made.
 start_time: 2025-08-07 08:20:00
 # Workbench alerts retrieval end time (UTC timezone),
 # If empty, defaults to the time the request is made.
@@ -58,24 +60,34 @@ fields:
       - alert.id
   - name: priority
     value: alert.severity
+    # Left = JIRA priority name (must exist in your JIRA), right = Vision One
+    # severity (critical, high, medium, low). Adjust the JIRA names to match
+    # your instance.
     mapping:
-      Lowest: low
-      Low: medium
-      High: high
       Highest: critical
+      High: high
+      Medium: medium
+      Low: low
 
-## JIRA issue status to Vision One Alert investigation status mapping
+## JIRA issue status to Vision One Alert status mapping
 status:
   # name: JIRA status name
-  # inv: Vision One Alert investigation status
-  # fields: (Optional) extra fields required to be set during the transition,
-  # for example when closing an issue, engineer resolution is required.
+  # inv: Vision One Alert status. Valid values: Open, In Progress, Closed.
+  #      The legacy value "New" is accepted as an alias for "Open".
+  # inv_result: (Optional) Vision One investigation result set when syncing
+  #      JIRA -> Vision One. Required when inv is "Closed" (Vision One rejects
+  #      closing an alert without a result). Valid values:
+  #      No Findings, Noteworthy, True Positive, False Positive,
+  #      Benign True Positive.
+  # fields: (Optional) extra JIRA fields set during the JIRA transition
+  #      (Vision One -> JIRA direction), e.g. a resolution when closing.
   - name: To Do
-    inv: New
+    inv: Open
   - name: In Progress
     inv: In Progress
   - name: Done
     inv: Closed
+    inv_result: True Positive
     fields:
       - name: Resolution
         value: Done

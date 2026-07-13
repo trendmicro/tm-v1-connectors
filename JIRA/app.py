@@ -1,4 +1,5 @@
 import base64
+import copy
 import dataclasses
 import datetime
 import logging
@@ -12,7 +13,7 @@ from typing import Any, Dict, List, Union
 
 import pytmv1
 import yaml
-from pytmv1 import EntityType, InvestigationStatus, ResultCode
+from pytmv1 import AlertStatus, EntityType, InvestigationResult, ResultCode
 from requests import Request, Session
 
 ALERT_DATE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -138,7 +139,11 @@ def _validate_keys(fields, status):
     error = False
     configs = [
         {"config": fields, "req": ("name", "value"), "optional": ("mapping",)},
-        {"config": status, "req": ("name", "inv"), "optional": ("fields",)},
+        {
+            "config": status,
+            "req": ("name", "inv"),
+            "optional": ("fields", "inv_result"),
+        },
     ]
     for cfg in configs:
         valid_keys = [*cfg["req"], *cfg["optional"]]
@@ -334,15 +339,20 @@ class App:
         return body
 
     def _fields_to_body(self, alert, fields):
-        copy = fields.copy()
-        _map_v1_fields_value(alert, copy)
+        # Deep copy so resolving Vision One attributes (alert.*) into concrete
+        # values does not mutate the shared config field dicts. A shallow copy
+        # overwrote the source "value" (e.g. "alert.id") with the first alert's
+        # resolved value; subsequent alerts then failed the "alert." prefix
+        # check and reused stale values, corrupting labels/priority.
+        fields = copy.deepcopy(fields)
+        _map_v1_fields_value(alert, fields)
         return {
             field.get("key"): (
                 [self._field_to_body(field, val) for val in field.get("value")]
                 if isinstance(field.get("value"), list)
                 else self._field_to_body(field, field.get("value"))
             )
-            for field in copy
+            for field in fields
         }
 
 
@@ -354,7 +364,13 @@ class App:
         if field_type == "number":
             return int(value)
         if field_type == "user":
-            return {"accountId": self._jira_user_acc_name(field.get("key"), value)}
+            user_ref = self._jira_user_acc_name(field.get("key"), value)
+            # JIRA Cloud identifies users by accountId (GDPR strict mode);
+            # on-premise (Server/Data Center) uses the username via "name".
+            # Mirror the auth-mode switch in _send: a configured username means
+            # Cloud, an empty one means on-premise.
+            ref_key = "accountId" if self.cfg.jira.get("username") else "name"
+            return {ref_key: user_ref}
         if isinstance(value, int) or str(value).isdigit():
             return {"id": str(value)}
         return {("name" if schema.get("system") else "value"): value}
@@ -388,7 +404,7 @@ class App:
     def _update_issue(self, alert):
         log.debug("Found in cache, checking if update required")
         jira_status = self._jira_status(alert)
-        v1_status = alert.investigation_status
+        v1_status = alert.status
         self._validate_curr_statuses(jira_status, v1_status)
         if self._is_status_equal(jira_status, v1_status):
             log.debug(
@@ -409,7 +425,7 @@ class App:
         if last_jira_update > last_v1_update:
             log.debug("JIRA updated after Vision One")
             self._v1_edit_status(
-                alert, self._get_config_status_by(jira_status, "key")["inv_st"]
+                alert, self._get_config_status_by(jira_status, "key")
             )
             return
         log.debug("Vision One updated after JIRA")
@@ -418,7 +434,14 @@ class App:
         json = {
             "transition": {"id": transition["id"]},
         }
-        fields = config_status.get("fields", [])
+        # "investigationResult" is a Vision One concept used for the JIRA -> V1
+        # direction (see _resolve_inv_result); it is not a JIRA field, so keep it
+        # out of the JIRA transition body.
+        fields = [
+            fi
+            for fi in config_status.get("fields", [])
+            if str(fi.get("name")).lower() != _INV_RESULT_KEY
+        ]
         if fields:
             if next(filter(lambda fi: not fi.get("schema"), fields), None):
                 _map_fields_metadata(fields, transition["fields"])
@@ -428,7 +451,7 @@ class App:
     def _jira_create_issue(self, alert):
         log.info("Creating JIRA issue")
 
-        # 获取alert的notes
+        # Fetch the alert's notes.
         notes = []
         try:
             response = self.v_client.note.consume(
@@ -585,8 +608,8 @@ class App:
         return _filter_jira_transition(response.json()["transitions"], status)
 
     def _jira_user_acc_name(self, field, value):
-        # 移除使用 "username" 查询参数的 JIRA 用户搜索 API 调用
-        # 这是为了适应 JIRA Cloud 的 GDPR 严格模式
+        # Removed the JIRA user-search API call that used the "username" query
+        # parameter, to comply with JIRA Cloud GDPR strict mode.
         log.debug(
             "Directly using JIRA user ID from config for field: %s, value: %s", field, value
         )
@@ -606,12 +629,24 @@ class App:
             raise RuntimeError
         log.info("Created Vision One note: %s", response.response.note_id)
 
-    def _v1_edit_status(self, alert, status):
-        log.debug("Editing Vision One alert status")
+    def _v1_edit_status(self, alert, config_status):
+        # pytmv1 >= 0.9 changed update_status to
+        # (alert_id, etag, status, inv_result, inv_status). ETag is the
+        # If-Match header, status is the AlertStatus body value. Passing them
+        # positionally in the old (alert_id, status, etag) order swapped the two
+        # and caused Vision One error 3090003.
+        status = config_status["inv_st"]
+        inv_result = _resolve_inv_result(config_status, status)
+        log.debug(
+            "Editing Vision One alert status to: %s (result: %s)",
+            status.value,
+            inv_result.value if inv_result else None,
+        )
         response = self.v_client.alert.update_status(
             alert.id,
-            status,
             self._v1_etag(alert),
+            status=status,
+            inv_result=inv_result,
         )
         log.debug("Received response from Vision One: %s", response)
         if ResultCode.SUCCESS != response.result_code:
@@ -653,7 +688,7 @@ class App:
                 alert_list.append(al)
                 if al.id in self.cache
                 or not self.cfg.skip_closed
-                or al.investigation_status != InvestigationStatus.CLOSED
+                or al.status != AlertStatus.CLOSED
                 else None
             ),
             self.start_time,
@@ -746,12 +781,12 @@ def _map_statuses_metadata(statuses, jira_statuses):
             ),
             None,
         )
-        investigation_status = _get_investigation_status(status["inv"])
+        alert_status = _get_alert_status(status["inv"])
         if matched_status:
             status["id"] = matched_status[0]
             status["key"] = matched_status[1]
-        if investigation_status:
-            status["inv_st"] = investigation_status
+        if alert_status:
+            status["inv_st"] = alert_status
     _validate_statuses(statuses, jira_statuses)
 
 
@@ -771,7 +806,7 @@ def _validate_statuses(statuses, jira_statuses):
             log.error(
                 "Vision One Status mapping error\nVision One Status not found: %s\nValid values: %s",
                 [st["inv"] for st in inv_status_not_found],
-                [inv.value for inv in InvestigationStatus],
+                [st.value for st in AlertStatus] + ["New (alias of Open)"],
             )
         raise ValueError
 
@@ -790,14 +825,78 @@ def _get_conf_field_by_name(config_fields, jira_field):
     )
 
 
-def _get_investigation_status(value):
+# Legacy config values that predate the AlertStatus vocabulary. Vision One
+# retired the "New" investigation status; the current alert lifecycle uses
+# AlertStatus (Open, In Progress, Closed). Map "New" to Open so existing
+# customer configurations keep working without an edit.
+_ALERT_STATUS_ALIASES = {"new": AlertStatus.OPEN}
+
+# Reserved status-mapping field name: a Vision One investigation result carried
+# in a status "fields" block. Used for the JIRA -> V1 direction, never sent to
+# JIRA as a field. Compared lower-cased.
+_INV_RESULT_KEY = "investigationresult"
+
+
+def _get_alert_status(value):
+    """Resolve a config ``inv`` value to a Vision One AlertStatus.
+
+    Accepts current AlertStatus values (Open, In Progress, Closed) plus the
+    legacy "New" alias for Open, keeping pre-breakage configs valid.
+    """
+    normalized = str(value).lower()
+    if normalized in _ALERT_STATUS_ALIASES:
+        return _ALERT_STATUS_ALIASES[normalized]
     return next(
-        filter(
-            lambda inv: inv.lower() == value.lower(),
-            InvestigationStatus,
-        ),
+        filter(lambda st: st.value.lower() == normalized, AlertStatus),
         None,
     )
+
+
+def _get_investigation_result(value):
+    return next(
+        filter(lambda ir: ir.value.lower() == str(value).lower(), InvestigationResult),
+        None,
+    )
+
+
+def _resolve_inv_result(config_status, status):
+    """Resolve the InvestigationResult to send when syncing JIRA -> Vision One.
+
+    Reads an explicit ``inv_result`` key, else falls back to an
+    ``investigationResult`` entry in the status ``fields`` (kept for backward
+    compatibility with existing configs). Vision One rejects closing an alert
+    without a result, so a missing result on a Closed transition is an error.
+    """
+    raw = config_status.get("inv_result")
+    if not raw:
+        field = next(
+            (
+                fi
+                for fi in config_status.get("fields", [])
+                if str(fi.get("name")).lower() == _INV_RESULT_KEY
+            ),
+            None,
+        )
+        raw = field.get("value") if field else None
+    if not raw:
+        if status == AlertStatus.CLOSED:
+            log.error(
+                "Closing a Vision One alert requires an investigation result. "
+                "Add 'inv_result' (or an 'investigationResult' field) to the "
+                "status mapping. Valid values: %s",
+                [ir.value for ir in InvestigationResult],
+            )
+            raise ValueError
+        return None
+    result = _get_investigation_result(raw)
+    if not result:
+        log.error(
+            "Vision One investigation result not valid\nValue: %s\nValid values: %s",
+            raw,
+            [ir.value for ir in InvestigationResult],
+        )
+        raise ValueError
+    return result
 
 
 def _map_v1_fields_value(alert, fields):
@@ -936,77 +1035,85 @@ def _format_config_time(alert_time):
     return None
 
 
+# Cap per description section so a noisy alert (e.g. a scanner dumping hundreds
+# of duplicate indicators) does not produce an unbounded JIRA description.
+_MAX_DESC_ITEMS = 50
+
+
+def _enum_val(value):
+    """Render an enum by its API value ("low"), not its member repr ("Severity.LOW")."""
+    return value.value if isinstance(value, Enum) else str(value)
+
+
+def _format_ref(value):
+    """Format an entity/indicator value that may be a plain string or a HostInfo."""
+    if isinstance(value, str):
+        return value
+    text = value.name
+    if getattr(value, "guid", None):
+        text += f" ({value.guid})"
+    if getattr(value, "ips", None):
+        text += " - " + ",".join(value.ips)
+    return text
+
+
+def _dedupe_cap(items):
+    """Drop duplicates (order-preserving) and cap length with an explicit note."""
+    unique = list(dict.fromkeys(items))
+    if len(unique) > _MAX_DESC_ITEMS:
+        omitted = len(unique) - _MAX_DESC_ITEMS
+        unique = unique[:_MAX_DESC_ITEMS] + [f"... ({omitted} more omitted)"]
+    return unique
+
+
 def _format_description(alert, notes=None):
     if hasattr(alert, "matched_rules"):
-        rules = "\n** ".join(rule.name for rule in alert.matched_rules)
+        rule_names = [rule.name for rule in alert.matched_rules]
     else:
-        rules = "\n** ".join(p.pattern for p in alert.matched_indicator_patterns)
+        rule_names = [p.pattern for p in alert.matched_indicator_patterns]
+    rules = "\n** ".join(_dedupe_cap(rule_names))
     entities = "\n** ".join(
-        entity.entity_type
-        + ": "
-        + (
-            entity.entity_value
-            if isinstance(entity.entity_value, str)
-            else entity.entity_value.name
-            + " ("
-            + entity.entity_value.guid
-            + ") - "
-            + ",".join(entity.entity_value.ips)
+        _dedupe_cap(
+            [
+                f"{_enum_val(entity.entity_type)}: {_format_ref(entity.entity_value)}"
+                for entity in alert.impact_scope.entities
+            ]
         )
-        for entity in alert.impact_scope.entities
     )
     indicators = "\n** ".join(
-        indicator.type
-        + ": "
-        + (
-            indicator.value
-            if isinstance(indicator.value, str)
-            else indicator.value.name
-            + " ("
-            + indicator.value.guid
-            + ") - "
-            + ",".join(indicator.value.ips)
+        _dedupe_cap(
+            [
+                f"{_enum_val(indicator.type)}: {_format_ref(indicator.value)}"
+                for indicator in alert.indicators
+            ]
         )
-        for indicator in alert.indicators
     )
-    mitres = []
+    mitre_ids = []
     if hasattr(alert, "matched_rules"):
         for rule in alert.matched_rules:
             for matched_filter in rule.matched_filters:
-                for tech in matched_filter.mitre_technique_ids:
-                    mitres.append(tech)
-    mitres = "\n** ".join(mitres)
-    
-    # 格式化notes部分
-    notes_section = ""
+                mitre_ids.extend(matched_filter.mitre_technique_ids)
+    mitres = "\n** ".join(_dedupe_cap(mitre_ids))
+    description = (
+        f"*Summary*\n\n* Detected by: XDR\n* Severity: {_enum_val(alert.severity)}\n"
+        f"* Score: {alert.score}\n\n\n"
+        f"*Event Details*\n\n* Vision One Model: {alert.model}\n* Rules\n** {rules}\n"
+        f"* Vision One Alert Highlights:\n** {entities}\n"
+        f"* Vision One Alert Indicators\n** {indicators}\n"
+        f"* MITRE ATT&CK:\n** {mitres}\n"
+        f"* Vision One Alert Link:\n** {alert.workbench_link}"
+    )
     if notes:
-        formatted_notes = "\n** ".join(notes)
-        #notes_section = f"*Alert Notes:\n** {formatted_notes}"
-    
-        return (
-            f"*Summary*\n\n* Detected by: XDR\n* Severity: {alert.severity}\n* Score: {alert.score}\n\n\n"
-            f"*Event Details*\n\n* Vision One Model: {alert.model}\n* Rules\n** {rules}\n"
-            f"* Vision One Alert Highlights:\n** {entities}\n"
-            f"* Vision One Alert Indicators\n** {indicators}\n"
-            f"* MITRE ATT&CK:\n** {mitres}\n"
-            f"* Vision One Alert Link:\n** {alert.workbench_link}\n"
-            f"* Alert Notes:\n** {formatted_notes}"
-        )
-    else:
-        return (
-            f"*Summary*\n\n* Detected by: XDR\n* Severity: {alert.severity}\n* Score: {alert.score}\n\n\n"
-            f"*Event Details*\n\n* Vision One Model: {alert.model}\n* Rules\n** {rules}\n"
-            f"* Vision One Alert Highlights:\n** {entities}\n"
-            f"* Vision One Alert Indicators\n** {indicators}\n"
-            f"* MITRE ATT&CK:\n** {mitres}\n"
-            f"* Vision One Alert Link:\n** {alert.workbench_link}"
-        )
+        description += "\n* Alert Notes:\n** " + "\n** ".join(notes)
+    return description
 
 
 def _format_summary(prefix, alert):
     host_entities = _format_host_entities(alert)
     if len(host_entities) > 0:
-        value = host_entities[0].entity_value.name
+        host_value = host_entities[0].entity_value
+        # Summary wants only the host name, not the guid/ip detail.
+        value = host_value if isinstance(host_value, str) else host_value.name
     else:
         value = "Container/Cloud"
     return (
