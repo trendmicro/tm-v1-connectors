@@ -1,9 +1,9 @@
 name: "JIRA Connector Release"
 
 # Triggered by pushing a tag matching jira-v* (e.g. jira-v1.0.0).
-# Packages only the JIRA/ directory into a tarball, publishes a versioned
-# GitHub release, and refreshes the moving "jira-latest" release/tag that the
-# README download link points to.
+# Packages only the JIRA/ directory into a tarball and publishes a versioned
+# GitHub release marked as "latest", so the README download link
+# (/releases/latest/download/...) always serves the newest JIRA build.
 on:
   push:
     tags:
@@ -41,15 +41,12 @@ jobs:
 
       - name: Publish versioned release
         run: |
+          # Mark this as the repo's latest release so the stable README link
+          # (/releases/latest/download/...) always serves the newest JIRA build.
+          # This replaces the old delete+recreate "jira-latest" moving tag, which
+          # is incompatible with the repo's immutable-releases setting (release
+          # tags cannot be deleted or reused once published).
           gh release create "${GITHUB_REF_NAME}" "${ASSET_NAME}" \
             --title "JIRA Connector v${{ steps.version.outputs.version }}" \
+            --latest \
             --notes "Trend Vision One JIRA connector v${{ steps.version.outputs.version }}. Download: ${ASSET_NAME}"
-
-      - name: Refresh jira-latest moving release
-        run: |
-          # Recreate the moving release so the stable README link always serves
-          # the newest JIRA build, independent of other connectors' releases.
-          gh release delete jira-latest --yes --cleanup-tag || true
-          gh release create jira-latest "${ASSET_NAME}" \
-            --title "JIRA Connector (latest: v${{ steps.version.outputs.version }})" \
-            --notes "Always points to the newest JIRA connector release (currently v${{ steps.version.outputs.version }})."

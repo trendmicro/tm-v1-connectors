@@ -58,7 +58,7 @@ API-token (basic) authentication.
 
 ### Download
 Latest packaged release (always points to the newest build):
-- [tm-v1-jira-connector.tar.gz](https://github.com/trendmicro/tm-v1-connectors/releases/download/jira-latest/tm-v1-jira-connector.tar.gz)
+- [tm-v1-jira-connector.tar.gz](https://github.com/trendmicro/tm-v1-connectors/releases/latest/download/tm-v1-jira-connector.tar.gz)
 
 Extract it:
 ```
